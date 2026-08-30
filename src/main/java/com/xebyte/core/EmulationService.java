@@ -2,15 +2,11 @@ package com.xebyte.core;
 
 import ghidra.app.emulator.EmulatorHelper;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressFactory;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.lang.Register;
-import ghidra.util.Msg;
-
 import java.math.BigInteger;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.*;
 
 /**
@@ -25,18 +21,18 @@ import java.util.*;
  * <pre>{@code
  * 1. decompile_function(hash_func_addr) → understand calling convention
  * 2. get_function_variables(hash_func) → identify input/output registers
- * 3. emulate_function(hash_func_addr, registers={ECX: string_ptr},
+ * 3. emulate_function(hash_func_addr, registers={x0: string_ptr},
  *        memory=[{addr: string_ptr, data: "CreateProcessW\0"}])
- *    → returns {EAX: 0x7C0DFCAA}
+ *    → returns {x0: 0x7C0DFCAA}
  * 4. Compare 0x7C0DFCAA against target hash → match!
  * 5. batch_set_comments(hash_call_addr, "Resolved: CreateProcessW")
  * }</pre>
  *
  * <h3>Batch mode for brute-forcing</h3>
  * <pre>{@code
- * emulate_hash_batch(hash_func_addr, register_template={ECX: "${STRING_PTR}"},
+ * emulate_hash_batch(hash_func_addr, register_template={x0: "${STRING_PTR}"},
  *     candidates=["CreateProcessW", "VirtualAlloc", "LoadLibraryA", ...],
- *     target_hash=0x7C0DFCAA, result_register="EAX")
+ *     target_hash=0x7C0DFCAA, result_register="x0")
  *   → returns {matched: "CreateProcessW", hash: 0x7C0DFCAA, iterations: 42}
  * }</pre>
  *
@@ -51,6 +47,9 @@ public class EmulationService {
     private static final int DEFAULT_MAX_STEPS = 10_000;
     private static final int MAX_STEPS = 100_000;
     private static final int MAX_CANDIDATES = 10_000;
+    private static final long STACK_BASE = 0x7FFF0000L;
+    // AArch64 PC values must be 4-byte aligned.
+    private static final long RETURN_SENTINEL = 0x7FFF1000L;
     // Scratch memory for writing candidate strings during emulation
     private static final long SCRATCH_BASE = 0x7FFE0000L;
     private static final int SCRATCH_SIZE = 0x10000;
@@ -84,7 +83,7 @@ public class EmulationService {
             @Param(value = "address", paramType = "address", source = ParamSource.BODY,
                     description = "Entry point address of the function to emulate") String addressStr,
             @Param(value = "registers", source = ParamSource.BODY, fieldsJson = true,
-                    description = "Initial register values as JSON: {\"EAX\": \"0x1234\", \"ECX\": \"0x7FFE0000\"}") String registersJson,
+                    description = "Initial register values as JSON: {\"x0\": \"0x1234\", \"x1\": \"0x7FFE0000\"}") String registersJson,
             @Param(value = "memory", source = ParamSource.BODY, fieldsJson = true,
                     description = "Memory regions to pre-populate as JSON array: [{\"address\": \"0x7FFE0000\", \"data\": \"base64...\"}] " +
                             "or [{\"address\": \"0x7FFE0000\", \"string\": \"CreateProcessW\\u0000\"}]") String memoryJson,
@@ -117,18 +116,6 @@ public class EmulationService {
         try {
             EmulatorHelper emu = new EmulatorHelper(program);
             try {
-                // Set up stack pointer
-                Address stackAddr = program.getAddressFactory()
-                        .getDefaultAddressSpace().getAddress(0x7FFF0000L);
-                emu.writeRegister("ESP", stackAddr.getOffset());
-                emu.writeRegister("EBP", stackAddr.getOffset());
-
-                // Write a return address to the stack (so RET has somewhere to go)
-                long returnSentinel = 0xDEADBEEFL;
-                byte[] retAddrBytes = ByteBuffer.allocate(4)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt((int) returnSentinel).array();
-                emu.writeMemory(stackAddr, retAddrBytes);
 
                 // Apply user-specified register values
                 if (registersJson != null && !registersJson.isEmpty()) {
@@ -174,6 +161,9 @@ public class EmulationService {
                     }
                 }
 
+                // Install the architecture-specific frame after caller-supplied
+                // registers so SP/FP/LR remain valid for return detection.
+                setupEmulationFrame(program, emu);
                 // Run emulation with a hard step bound. emu.run(...) is
                 // unbounded — it loops until a breakpoint or fault — so a
                 // target with an infinite loop (or one that never executes
@@ -201,7 +191,7 @@ public class EmulationService {
                         break;
                     }
                     pc = emu.getExecutionAddress();
-                    if (pc != null && pc.getOffset() == returnSentinel) {
+                    if (pc != null && pc.getOffset() == RETURN_SENTINEL) {
                         hitReturn = true;
                         stopReason = "return";
                         break;
@@ -239,9 +229,8 @@ public class EmulationService {
                         }
                     }
                 } else {
-                    // Return common general-purpose registers
-                    for (String rn : new String[]{"EAX", "EBX", "ECX", "EDX",
-                            "ESI", "EDI", "ESP", "EBP", "EIP"}) {
+                    // Return common general-purpose registers for this language.
+                    for (String rn : defaultGeneralPurposeRegisters(program)) {
                         try {
                             BigInteger val = emu.readRegister(rn);
                             regValues.put(rn, "0x" + val.toString(16));
@@ -333,9 +322,9 @@ public class EmulationService {
             @Param(value = "hash_function_address", paramType = "address", source = ParamSource.BODY,
                     description = "Address of the hash computation function") String hashFuncAddr,
             @Param(value = "string_register", source = ParamSource.BODY,
-                    description = "Register that receives the pointer to the API name string (e.g., ECX, RCX, EDI)") String stringRegister,
-            @Param(value = "result_register", source = ParamSource.BODY, defaultValue = "EAX",
-                    description = "Register that contains the computed hash after emulation (e.g., EAX, RAX)") String resultRegister,
+                    description = "Register that receives the pointer to the API name string (e.g., x0, x1, RCX)") String stringRegister,
+            @Param(value = "result_register", source = ParamSource.BODY, defaultValue = "",
+                    description = "Register containing the computed hash (defaults to x0 on AArch64, EAX otherwise)") String resultRegister,
             @Param(value = "target_hash", source = ParamSource.BODY,
                     description = "Target hash value to match (hex string like 0x7C0DFCAA)") String targetHashStr,
             @Param(value = "candidates", source = ParamSource.BODY, fieldsJson = true,
@@ -355,6 +344,9 @@ public class EmulationService {
 
         Function func = program.getFunctionManager().getFunctionAt(entryAddr);
         if (func == null) return Response.err("No function at address: " + hashFuncAddr);
+        if (resultRegister == null || resultRegister.isBlank()) {
+            resultRegister = isAarch64(program) ? "x0" : "EAX";
+        }
 
         long targetHash;
         try {
@@ -401,9 +393,8 @@ public class EmulationService {
 
             Address scratchAddr = program.getAddressFactory()
                     .getDefaultAddressSpace().getAddress(SCRATCH_BASE);
-            Address stackAddr = program.getAddressFactory()
-                    .getDefaultAddressSpace().getAddress(0x7FFF0000L);
-            long returnSentinel = 0xDEADBEEFL;
+            Address returnAddr = program.getAddressFactory()
+                    .getDefaultAddressSpace().getAddress(RETURN_SENTINEL);
 
             List<Map<String, String>> matches = new ArrayList<>();
             int tested = 0;
@@ -412,13 +403,6 @@ public class EmulationService {
                 tested++;
                 EmulatorHelper emu = new EmulatorHelper(program);
                 try {
-                    // Set up stack
-                    emu.writeRegister("ESP", stackAddr.getOffset());
-                    emu.writeRegister("EBP", stackAddr.getOffset());
-                    byte[] retBytes = ByteBuffer.allocate(4)
-                            .order(ByteOrder.LITTLE_ENDIAN)
-                            .putInt((int) returnSentinel).array();
-                    emu.writeMemory(stackAddr, retBytes);
 
                     // Write candidate string to scratch memory
                     byte[] strBytes;
@@ -437,9 +421,11 @@ public class EmulationService {
                         emu.writeRegister(entry.getKey(), entry.getValue());
                     }
 
+                    // Initialize the architecture-specific frame after the
+                    // caller-supplied register values are installed.
+                    setupEmulationFrame(program, emu);
                     // Set breakpoint at return sentinel
-                    emu.setBreakpoint(program.getAddressFactory()
-                            .getDefaultAddressSpace().getAddress(returnSentinel));
+                    emu.setBreakpoint(returnAddr);
 
                     // Run
                     emu.run(entryAddr, null, new ghidra.util.task.ConsoleTaskMonitor());
@@ -478,6 +464,76 @@ public class EmulationService {
     // Helpers
     // ========================================================================
 
+    private static boolean isAarch64(Program program) {
+        String processor = program.getLanguage().getProcessor().toString();
+        String languageId = program.getLanguage().getLanguageID().getIdAsString();
+        return "AARCH64".equalsIgnoreCase(processor) ||
+                languageId.regionMatches(true, 0, "AARCH64:", 0, 8);
+    }
+
+    private static String findRegister(
+            Program program,
+            String... candidates) {
+
+        for (String candidate : candidates) {
+            if (candidate != null &&
+                    program.getRegister(candidate) != null) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static void setupEmulationFrame(
+            Program program,
+            EmulatorHelper emu) throws Exception {
+
+        AddressSpace stackSpace =
+                program.getCompilerSpec().getStackBaseSpace();
+        Address stackAddress = stackSpace.getAddress(STACK_BASE);
+
+        Register stackPointer = emu.getStackPointerRegister();
+        emu.writeRegister(stackPointer, stackAddress.getOffset());
+
+        String framePointer = findRegister(
+                program, "x29", "X29", "fp", "FP", "RBP", "EBP");
+        if (framePointer != null) {
+            emu.writeRegister(framePointer, stackAddress.getOffset());
+        }
+
+        // AArch64 RET uses X30/LR. Stack-return architectures use [SP].
+        String linkRegister = findRegister(
+                program, "x30", "X30", "lr", "LR", "r30", "R30");
+        if (linkRegister != null) {
+            emu.writeRegister(linkRegister, RETURN_SENTINEL);
+        }
+        else {
+            emu.writeStackValue(
+                    0,
+                    stackSpace.getPointerSize(),
+                    RETURN_SENTINEL);
+        }
+    }
+
+    private static List<String> defaultGeneralPurposeRegisters(
+            Program program) {
+
+        List<String> registers = new ArrayList<>();
+        if (isAarch64(program)) {
+            for (int i = 0; i <= 30; i++) {
+                registers.add("x" + i);
+            }
+            registers.add("sp");
+            registers.add("pc");
+        }
+        else {
+            Collections.addAll(
+                    registers,
+                    "EAX", "EBX", "ECX", "EDX",
+                    "ESI", "EDI", "ESP", "EBP", "EIP");
+        }
+        return registers;
+    }
     private static long parseLongValue(String s) {
         if (s == null || s.isEmpty()) return 0;
         s = s.trim();

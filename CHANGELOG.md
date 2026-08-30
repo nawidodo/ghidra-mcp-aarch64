@@ -73,7 +73,10 @@ name-quality rejection that `rename_data` applied.
   pre-prefix stem as a fallback.
 - `get_function_labels` accepts an address as well as a name, and reports a
   clear error when the parameter is missing.
-
+- `EmulationService` now initializes architecture-appropriate stack/frame/link
+  registers and returns AArch64 general-purpose registers, so isolated P-code
+  emulation works for ARM64 Mach-O functions instead of using x86-only
+  `ESP`/`EAX` defaults.
 **Internal callers migrated.** fun-doc (workers, prompts, provider tool
 allowlists, benchmark harness), the Python bridge's per-endpoint timeout table,
 the deploy smoke tests in `tools/setup`, the bundled `DocumentFunctionWithClaude`
